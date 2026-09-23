@@ -186,6 +186,10 @@ Cloudflare API Token 在 <https://dash.cloudflare.com/profile/api-tokens> 创建
 | `/etc/sysctl.d/99-onekey.profile.md` | 调优依据说明 |
 | `/etc/onekey/tune-backup/` | 调优前备份（用于回滚） |
 
+## 开发进度
+
+进度、测试结论和待办事项见 [docs/PROGRESS.md](docs/PROGRESS.md)。
+
 ## 致谢
 
 - [apernet/hysteria](https://github.com/apernet/hysteria)
