@@ -3,15 +3,15 @@
 # onekey —— Surge / Shadowrocket 一键部署脚本
 #   Hysteria2（主力，UDP/QUIC + 端口跳跃 + 自动 ACME 证书）
 #   Snell v5（备用，TCP，仅 Surge）
-#   自动检测 VPS 带宽 / 自动开启 BBR / 修改 SSH 端口 / 禁用密码仅密钥登录
+#   自动检测带宽 / 网络诊断与可回滚调优（BBR+fq+BDP 缓冲）/ 修改 SSH 端口 / 仅密钥登录
 #
 # 支持系统：Debian 10+ / Ubuntu 20.04+ / CentOS Stream / Rocky / Alma
 # 项目地址：https://github.com/NextCandy/onekey
-# 用法：bash install.sh [install|info|domain|bandwidth|ssh-port|ssh-key|bbr|update|uninstall]
+# 用法：bash install.sh [install|info|domain|bandwidth|diag|tune|tune-rollback|ssh-port|ssh-key|update|uninstall]
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.2.0"
 SNELL_VERSION="v5.0.1"
 
 ONEKEY_DIR="/etc/onekey"
@@ -87,6 +87,7 @@ install_deps() {
     command -v qrencode >/dev/null || $PKG_INSTALL qrencode >/dev/null 2>&1 || true
     command -v jq >/dev/null || $PKG_INSTALL jq >/dev/null 2>&1 || true
     command -v openssl >/dev/null || $PKG_INSTALL openssl >/dev/null 2>&1 || true
+    command -v tracepath >/dev/null || $PKG_INSTALL iputils-tracepath >/dev/null 2>&1 || $PKG_INSTALL iputils >/dev/null 2>&1 || true
     ok "依赖安装完成"
 }
 
@@ -178,32 +179,245 @@ EOF
 }
 
 # ============================================================
-# BBR / 系统优化
+# 网络诊断 / 调优（先测量、有依据才改、可回滚）
 # ============================================================
 
-enable_bbr() {
-    local kmaj kmin
+# 国内三网探测目标（只发小 ICMP 包；部分服务商会丢弃大 ICMP 包）
+CN_TARGETS4=("202.96.209.133:电信" "219.158.3.1:联通" "211.136.192.6:移动" "202.97.1.1:电信骨干")
+CN_TARGETS6=("240e:e9:6002:15c::1:电信" "2408:8899::8:联通" "2409:8088::a:移动")
+TUNE_KEYS="net.core.default_qdisc net.ipv4.tcp_congestion_control net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.tcp_notsent_lowat net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_mtu_probing"
+
+# $1=4|6 $2=ip  输出 "丢包% 平均RTT"，不通输出空
+ping_stat() {
+    # ping 不通时返回非 0，在 pipefail 下会中断调用方，这里吞掉退出码
+    { ping -"$1" -c 20 -i 0.2 -W 1 "$2" 2>/dev/null || true; } | awk -F'[ /,%]+' '
+        /packet loss/ {for (i = 1; i <= NF; i++) if ($i == "packet") loss = $(i - 1)}
+        /^rtt|^round-trip/ {avg = $8}
+        END {if (avg != "") printf "%s %s\n", loss, avg}'
+}
+
+fmt_ping() {
+    if [[ -n "$1" ]]; then echo "丢包 ${1% *}%  RTT ${1#* } ms"; else echo "不响应 ICMP（不代表不通）"; fi
+}
+
+# 到国内的中位 RTT（毫秒，整数）；全部不通时输出 0
+china_rtt() {
+    local t ip r rtts=()
+    for t in "${CN_TARGETS4[@]}"; do
+        ip=${t%%:*}; r=$(ping_stat 4 "${ip}")
+        [[ -n "${r}" ]] && rtts+=("${r#* }")
+    done
+    if (( ${#rtts[@]} == 0 )); then
+        for t in "${CN_TARGETS6[@]}"; do
+            ip=${t%:*}; r=$(ping_stat 6 "${ip}")
+            [[ -n "${r}" ]] && rtts+=("${r#* }")
+        done
+    fi
+    (( ${#rtts[@]} > 0 )) || { echo 0; return; }
+    printf '%s\n' "${rtts[@]}" | sort -n | awk '{a[NR] = $1} END {printf "%d\n", a[int((NR + 1) / 2)]}'
+}
+
+# 输出：TcpOutSegs TcpRetransSegs UdpRcvbufErrors(含v6) UdpSndbufErrors(含v6)
+counters() {
+    nstat -az 2>/dev/null | awk '{v[$1] = $2} END {printf "%d %d %d %d\n", v["TcpOutSegs"], v["TcpRetransSegs"],
+        v["UdpRcvbufErrors"] + v["Udp6RcvbufErrors"], v["UdpSndbufErrors"] + v["Udp6SndbufErrors"]}'
+}
+
+root_qdisc() { tc qdisc show dev "$1" root 2>/dev/null | awk 'NR==1{print $2}'; }
+
+# 让已存在的网卡队列也切换到 fq（default_qdisc 只对新建队列生效）
+apply_fq() {
+    local dev q
+    dev=$(default_iface); [[ -n "${dev}" ]] || return 0
+    q=$(root_qdisc "${dev}")
+    case "${q}" in
+        fq) ;;
+        mq) tc qdisc del dev "${dev}" root 2>/dev/null || true ;;   # 删除后内核按 default_qdisc 重建 mq + fq 子队列
+        *)  tc qdisc replace dev "${dev}" root fq 2>/dev/null || warn "无法把 ${dev} 的队列切换为 fq" ;;
+    esac
+    echo "   ${dev} 队列：${q:-未知} -> $(root_qdisc "${dev}")"
+}
+
+do_diag() {
+    local dev t ip r a b d1 d2 o1 o2
+    dev=$(default_iface)
+    echo
+    info "网络诊断（只读，不修改任何配置）"
+    echo "== 系统"
+    echo "   内核 $(uname -r) | CPU $(nproc) 核 | 内存 $(free -m | awk '/Mem:/{print $2}') MB | 网卡 ${dev} MTU $(cat /sys/class/net/"${dev}"/mtu 2>/dev/null)"
+    echo "== TCP / 队列"
+    echo "   拥塞控制 $(sysctl -n net.ipv4.tcp_congestion_control)（可用：$(sysctl -n net.ipv4.tcp_available_congestion_control)）"
+    echo "   default_qdisc $(sysctl -n net.core.default_qdisc) | 网卡实际队列 $(root_qdisc "${dev}")"
+    echo "   tcp_rmem [$(sysctl -n net.ipv4.tcp_rmem | tr '\t' ' ')] | tcp_wmem [$(sysctl -n net.ipv4.tcp_wmem | tr '\t' ' ')]"
+    echo "   rmem_max $(sysctl -n net.core.rmem_max) | wmem_max $(sysctl -n net.core.wmem_max) | mtu_probing $(sysctl -n net.ipv4.tcp_mtu_probing)"
+    [[ "$(root_qdisc "${dev}")" == "$(sysctl -n net.core.default_qdisc)" || "$(root_qdisc "${dev}")" == mq ]] \
+        || warn "网卡实际队列与 default_qdisc 不一致（可通过「网络调优」修正）"
+
+    echo "== 国内三网延迟 / 丢包（20 个小包）"
+    for t in "${CN_TARGETS4[@]}"; do
+        ip=${t%%:*}; r=$(ping_stat 4 "${ip}")
+        printf "   IPv4 %-8s %-16s %s\n" "${t##*:}" "${ip}" "$(fmt_ping "${r}")"
+    done
+    if [[ -n "$(ip -6 route show default 2>/dev/null)" ]]; then
+        for t in "${CN_TARGETS6[@]}"; do
+            ip=${t%:*}; r=$(ping_stat 6 "${ip}")
+            printf "   IPv6 %-8s %-24s %s\n" "${t##*:}" "${ip}" "$(fmt_ping "${r}")"
+        done
+    fi
+    echo "   说明：中间路由器丢包多为 ICMP 限速，以终点为准；丢包在跨境路径上时，本机调参无法解决"
+
+    echo "== PMTU"
+    echo "   tracepath 1.1.1.1：$(tracepath -n -m 15 1.1.1.1 2>/dev/null | grep -oE 'pmtu [0-9]+' | tail -1 || echo 未知)"
+    if [[ -n "$(ip -6 route show default 2>/dev/null)" ]]; then
+        echo "   tracepath IPv6：$(tracepath -6 -n -m 15 2606:4700:4700::1111 2>/dev/null | grep -oE 'pmtu [0-9]+' | tail -1 || echo 未知)"
+    fi
+
+    echo "== 10 秒计数器增量（反映当前真实流量）"
+    a=$(counters)
+    d1=$(tc -s qdisc show dev "${dev}" | awk '/dropped/{gsub(",", ""); s += $7} END{print s + 0}')
+    sleep 10
+    b=$(counters)
+    d2=$(tc -s qdisc show dev "${dev}" | awk '/dropped/{gsub(",", ""); s += $7} END{print s + 0}')
+    read -r o1 x1 y1 z1 <<<"${a}"; read -r o2 x2 y2 z2 <<<"${b}"
+    echo "   TCP 发送 $((o2 - o1)) 段，重传 $((x2 - x1)) 段 | 网卡队列丢包 $((d2 - d1)) | UDP 收/发缓冲错误 $((y2 - y1))/$((z2 - z1))"
+    echo "   判断：队列丢包为 0 而重传高 → 路径/对端问题；UDP 缓冲错误增长 → 需要调大 UDP 缓冲"
+    echo
+    echo "提示：要测真实下载方向，请在国内设备上用 iperf3 或测速网站走代理测试"
+}
+
+# 备份当前 sysctl 配置与运行时的值（用于回滚）
+tune_backup() {
+    local dir k
+    dir="${ONEKEY_DIR}/tune-backup/$(date +%Y%m%d%H%M%S)"
+    mkdir -p "${dir}/sysctl.d"
+    cp -a /etc/sysctl.d/. "${dir}/sysctl.d/" 2>/dev/null || true
+    [[ -f /etc/sysctl.conf ]] && cp -a /etc/sysctl.conf "${dir}/"
+    for k in ${TUNE_KEYS}; do echo "${k} = $(sysctl -n "${k}" 2>/dev/null | tr '\t' ' ')"; done >"${dir}/runtime.conf"
+    echo "$(root_qdisc "$(default_iface)")" >"${dir}/qdisc"
+    echo "${dir}"
+}
+
+do_tune() {
+    local kmaj kmin rtt bw mem_mb bdp buf cap bak legacy dev
     kmaj=$(uname -r | cut -d. -f1); kmin=$(uname -r | cut -d. -f2)
     if (( kmaj < 4 || (kmaj == 4 && kmin < 9) )); then
-        warn "内核 $(uname -r) 低于 4.9，不支持 BBR，已跳过"
+        warn "内核 $(uname -r) 低于 4.9，不支持 BBR，已跳过网络调优"
         return 0
     fi
     modprobe tcp_bbr 2>/dev/null || true
+    sysctl -n net.ipv4.tcp_available_congestion_control | grep -qw bbr || { warn "内核未提供 BBR，已跳过"; return 0; }
+
+    # ---- 测量 ----
+    info "测量到国内的 RTT..."
+    rtt=$(china_rtt); (( rtt > 0 )) || { rtt=200; warn "国内目标均不响应 ICMP，按 200ms 估算"; }
+    bw=${BW_UP:-}
+    if [[ -z "${bw}" ]]; then
+        if [[ -f "${ENV_FILE}" ]]; then bw=$(. "${ENV_FILE}"; echo "${BW_UP:-}"); fi
+    fi
+    [[ -n "${bw}" ]] || { detect_bandwidth; bw=${BW_UP}; }
+    mem_mb=$(free -m | awk '/Mem:/{print $2}')
+
+    # ---- 计算 TCP 缓冲上限：2 × BDP，限制在 8MB~64MB，且不超过内存的 1/16 ----
+    bdp=$(( bw * 1000000 / 8 * rtt / 1000 ))
+    buf=$(( bdp * 2 ))
+    cap=$(( mem_mb * 1024 * 1024 / 16 ))
+    (( buf > 67108864 )) && buf=67108864
+    (( buf > cap )) && buf=${cap}
+    (( buf < 8388608 )) && buf=8388608
+    buf=$(( (buf + 1048575) / 1048576 * 1048576 ))   # 取整到 MB
+
+    echo
+    echo "   测量依据：VPS 上行 ${bw} Mbps × 国内 RTT ${rtt} ms → BDP $((bdp / 1048576)) MB；内存 ${mem_mb} MB"
+    echo "   计划写入 ${SYSCTL_FILE}："
+    echo "     BBR + fq（并把网卡现有队列切换为 fq）"
+    echo "     TCP 缓冲上限 $((buf / 1048576)) MB（原 tcp_wmem 上限 $(( $(sysctl -n net.ipv4.tcp_wmem | awk '{print $3}') / 1048576 )) MB）"
+    echo "     UDP 缓冲 16 MB（Hysteria2 / QUIC）"
+    echo "     tcp_notsent_lowat 128KB、tcp_slow_start_after_idle 0、tcp_mtu_probing 1"
+    echo "   不修改：MTU、网卡限速（TBF/HTB）、netdev_max_backlog —— 无测量证据支持"
+    if [[ -z "${ONEKEY_TUNE_YES:-}" ]]; then
+        local yn
+        read -rp "确认应用？会先备份，可通过「回滚网络调优」恢复 [Y/n] " yn
+        [[ "${yn:-Y}" =~ ^[Yy]$ ]] || { warn "已取消"; return 0; }
+    fi
+
+    # ---- 备份并写入 ----
+    bak=$(tune_backup)
+    # 旧版脚本写入的同类文件会与本文件产生顺序冲突，移入备份目录
+    for legacy in /etc/sysctl.d/99-surge-proxy.conf; do
+        [[ -f "${legacy}" ]] && grep -q "QUIC 需要更大的 UDP 缓冲区" "${legacy}" && mv "${legacy}" "${bak}/moved-$(basename "${legacy}")"
+    done
     echo "tcp_bbr" >/etc/modules-load.d/onekey-bbr.conf
     cat >"${SYSCTL_FILE}" <<EOF
-# QUIC 需要更大的 UDP 缓冲区
-net.core.rmem_max = 16777216
-net.core.wmem_max = 16777216
-# BBR
+# onekey 网络调优（落地机：用户 -> VPS -> 互联网；关键方向 VPS 出口 -> 用户下载）
+# 生成时间：$(date '+%F %T')  依据：VPS 上行 ${bw} Mbps，国内 RTT ${rtt} ms，内存 ${mem_mb} MB
+# 备份：${bak}
+
+# BBR + fq：fq 为 BBR 提供 pacing 与流间公平
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
+
+# TCP 缓冲上限 = 2 × BDP（8~64MB，且不超过内存 1/16），影响 Snell 等 TCP 协议的单连接速度
+net.ipv4.tcp_rmem = 4096 131072 ${buf}
+net.ipv4.tcp_wmem = 4096 16384 ${buf}
+# socket 缓冲上限；Hysteria2（QUIC）需要至少 16MB 的 UDP 缓冲
+net.core.rmem_max = $(( buf > 16777216 ? buf : 16777216 ))
+net.core.wmem_max = $(( buf > 16777216 ? buf : 16777216 ))
+
+# 限制未发送数据在 socket 中堆积，降低大缓冲带来的排队延迟
+net.ipv4.tcp_notsent_lowat = 131072
+# 代理长连接空闲后不重新慢启动（Snell reuse=true）
+net.ipv4.tcp_slow_start_after_idle = 0
+# 仅在检测到 PMTU 黑洞时启用 MTU 探测（部分服务商丢弃 ICMP）
+net.ipv4.tcp_mtu_probing = 1
 EOF
     sysctl --system >/dev/null 2>&1 || true
-    if [[ "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" == "bbr" ]]; then
-        ok "BBR 已开启（$(sysctl -n net.core.default_qdisc) + bbr），UDP 缓冲区已调大"
-    else
-        warn "BBR 开启失败，当前拥塞控制：$(sysctl -n net.ipv4.tcp_congestion_control)"
+    apply_fq
+
+    # ---- 回读 ----
+    echo "   生效值："
+    sysctl net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.tcp_rmem net.ipv4.tcp_wmem \
+        net.core.rmem_max net.core.wmem_max net.ipv4.tcp_notsent_lowat net.ipv4.tcp_slow_start_after_idle \
+        net.ipv4.tcp_mtu_probing 2>/dev/null | sed 's/^/     /'
+
+    cat >"${SYSCTL_FILE%.conf}.profile.md" <<EOF
+# onekey 网络调优说明
+
+- 时间：$(date '+%F %T')
+- 角色：落地机（用户 -> VPS -> 互联网），关键方向：VPS 出口 -> 用户下载
+- 协议：Hysteria2（UDP/QUIC）、Snell v5（TCP）
+- 测量：VPS 上行 ${bw} Mbps（Cloudflare 测速，代表端口能力上限）；国内三网中位 RTT ${rtt} ms；内存 ${mem_mb} MB
+- 选择：BBR + fq；TCP 缓冲上限 $((buf / 1048576)) MB（2 × BDP）；UDP 缓冲 ≥16MB；notsent_lowat 128KB；slow_start_after_idle 0；mtu_probing 1
+- 未改动：MTU、TBF/HTB、netdev_max_backlog（无队列丢包等证据）
+- 注意：TCP 缓冲只影响 Snell 等 TCP 协议；跨境路径丢包无法通过本机调参解决
+- 备份：${bak}
+- 回滚：bash install.sh tune-rollback
+EOF
+    ok "网络调优已应用，说明文件：${SYSCTL_FILE%.conf}.profile.md，备份：${bak}"
+}
+
+do_tune_rollback() {
+    local base dir k v dev q
+    base="${ONEKEY_DIR}/tune-backup"
+    dir=$(ls -1d "${base}"/*/ 2>/dev/null | sort | head -1 || true)
+    [[ -n "${dir}" ]] || die "没有找到网络调优备份"
+    dir=${dir%/}
+    echo "将恢复到最早的备份（调优前的原始状态）：${dir}"
+    confirm "确认回滚？" || return 0
+    rm -f "${SYSCTL_FILE}" "${SYSCTL_FILE%.conf}.profile.md" /etc/modules-load.d/onekey-bbr.conf
+    cp -a "${dir}/sysctl.d/." /etc/sysctl.d/
+    [[ -f "${dir}/sysctl.conf" ]] && cp -a "${dir}/sysctl.conf" /etc/sysctl.conf
+    # sysctl --system 不会还原已删除的键，按备份的运行时值逐项恢复
+    local line
+    while IFS= read -r line; do
+        k=${line%% = *}; v=${line#* = }
+        [[ -n "${k}" && -n "${v}" ]] && { sysctl -w "${k}=${v}" >/dev/null 2>&1 || true; }
+    done <"${dir}/runtime.conf"
+    sysctl --system >/dev/null 2>&1 || true
+    dev=$(default_iface); q=$(cat "${dir}/qdisc" 2>/dev/null || true)
+    if [[ -n "${dev}" && -n "${q}" && "${q}" != "$(root_qdisc "${dev}")" && "${q}" != mq ]]; then
+        tc qdisc replace dev "${dev}" root "${q}" 2>/dev/null || true
     fi
+    ok "已回滚。当前：$(sysctl -n net.ipv4.tcp_congestion_control) + $(root_qdisc "${dev}")，tcp_wmem [$(sysctl -n net.ipv4.tcp_wmem | tr '\t' ' ')]"
 }
 
 # ============================================================
@@ -1037,9 +1251,9 @@ do_install() {
     check_arch
     install_deps
     read_inputs
-    enable_bbr
     detect_bandwidth
     ask_client_down
+    do_tune
     open_firewall
     setup_port_hopping
     install_hysteria
@@ -1061,7 +1275,7 @@ do_update() {
 }
 
 do_uninstall() {
-    confirm "确认卸载 Hysteria2、Snell 和端口跳跃规则？（SSH 设置与 BBR 保持不变）" || exit 0
+    confirm "确认卸载 Hysteria2、Snell 和端口跳跃规则？（SSH 设置与网络调优保持不变，调优可单独回滚）" || exit 0
     systemctl disable --now hy2-porthop.service >/dev/null 2>&1 || true
     rm -f "${HOP_SERVICE}" "${HOP_SCRIPT}"
     bash <(curl -fsSL https://get.hy2.sh/) --remove >/dev/null 2>&1 || true
@@ -1097,26 +1311,31 @@ menu() {
         echo "  3. 域名与证书（查看 / 更换域名 / 重新申请）"
         echo "  4. 重新检测带宽并更新"
         echo "  ------------------------------------------------"
-        echo "  5. 修改 SSH 端口"
-        echo "  6. 禁用密码登录（仅允许密钥登录）"
-        echo "  7. 开启 BBR"
+        echo "  5. 网络诊断（只读：三网延迟丢包 / PMTU / 重传）"
+        echo "  6. 网络调优（BBR + fq + 按 BDP 计算缓冲，可回滚）"
+        echo "  7. 回滚网络调优"
         echo "  ------------------------------------------------"
-        echo "  8. 更新 Hysteria2 / Snell"
-        echo "  9. 卸载"
+        echo "  8. 修改 SSH 端口"
+        echo "  9. 禁用密码登录（仅允许密钥登录）"
+        echo "  ------------------------------------------------"
+        echo " 10. 更新 Hysteria2 / Snell"
+        echo " 11. 卸载"
         echo "  0. 退出"
         echo
-        read -rp "请选择 [0-9]：" n
+        read -rp "请选择 [0-11]：" n
         # 每个操作在子 shell 中执行：出错只结束当前操作，回到菜单
         case "${n}" in
             1) ( do_install ) || true ;;
             2) ( show_info ) || true ;;
             3) ( do_domain ) || true ;;
             4) ( do_bandwidth ) || true ;;
-            5) ( do_ssh_port ) || true ;;
-            6) ( do_ssh_key ) || true ;;
-            7) ( enable_bbr ) || true ;;
-            8) ( do_update ) || true ;;
-            9) ( do_uninstall ) || true ;;
+            5) ( do_diag ) || true ;;
+            6) ( do_tune ) || true ;;
+            7) ( do_tune_rollback ) || true ;;
+            8) ( do_ssh_port ) || true ;;
+            9) ( do_ssh_key ) || true ;;
+            10) ( do_update ) || true ;;
+            11) ( do_uninstall ) || true ;;
             0) exit 0 ;;
             *) warn "无效选项" ;;
         esac
@@ -1134,11 +1353,13 @@ main() {
         bandwidth) do_bandwidth ;;
         ssh-port)  do_ssh_port ;;
         ssh-key)   do_ssh_key ;;
-        bbr)       enable_bbr ;;
+        diag)      do_diag ;;
+        tune|bbr)  do_tune ;;
+        tune-rollback) do_tune_rollback ;;
         update)    do_update ;;
         uninstall) do_uninstall ;;
         "")        menu ;;
-        *)         die "未知参数：$1（可用：install|info|domain|bandwidth|ssh-port|ssh-key|bbr|update|uninstall）" ;;
+        *)         die "未知参数：$1（可用：install|info|domain|bandwidth|diag|tune|tune-rollback|ssh-port|ssh-key|update|uninstall）" ;;
     esac
 }
 

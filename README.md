@@ -8,7 +8,8 @@ Surge / Shadowrocket 一键部署脚本：**Hysteria2 + Snell v5**，交互式�
 - **Snell v5**（备用）：TCP，Surge 官方协议，UDP 被限速/阻断时自动回落
 - **IPv4 / IPv6 双线路**：默认 IPv4，可在客户端切换 IPv6
 - **自动检测 VPS 带宽**并写入 Hysteria2 服务端配置
-- **自动开启 BBR**，调大 UDP 缓冲区
+- **网络诊断（只读）**：国内三网延迟/丢包、PMTU、重传与队列丢包增量
+- **有依据的网络调优**：BBR + fq（并修正网卡实际队列），TCP 缓冲按实测 BDP 计算；先展示计划再确认，自动备份，**一键回滚**
 - **修改 SSH 端口**（新旧端口过渡，确认可登录后再关闭旧端口）
 - **禁用密码登录，仅允许密钥登录**（支持粘贴公钥 / 服务器生成密钥对）
 - 自动输出 **Surge 配置**和 **Shadowrocket 链接 + 终端二维码**
@@ -26,7 +27,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/NextCandy/onekey/main/instal
 ## 菜单
 
 ```
-  onekey v1.1.0 —— Hysteria2 + Snell for Surge / Shadowrocket
+  onekey v1.2.0 —— Hysteria2 + Snell for Surge / Shadowrocket
   ------------------------------------------------
   状态：Hysteria2 active | Snell active | BBR bbr | SSH 端口 22
   ------------------------------------------------
@@ -35,12 +36,15 @@ bash <(curl -fsSL https://raw.githubusercontent.com/NextCandy/onekey/main/instal
   3. 域名与证书（查看 / 更换域名 / 重新申请）
   4. 重新检测带宽并更新
   ------------------------------------------------
-  5. 修改 SSH 端口
-  6. 禁用密码登录（仅允许密钥登录）
-  7. 开启 BBR
+  5. 网络诊断（只读：三网延迟丢包 / PMTU / 重传）
+  6. 网络调优（BBR + fq + 按 BDP 计算缓冲，可回滚）
+  7. 回滚网络调优
   ------------------------------------------------
-  8. 更新 Hysteria2 / Snell
-  9. 卸载
+  8. 修改 SSH 端口
+  9. 禁用密码登录（仅允许密钥登录）
+  ------------------------------------------------
+ 10. 更新 Hysteria2 / Snell
+ 11. 卸载
   0. 退出
 ```
 
@@ -51,9 +55,11 @@ bash install.sh install     # 安装
 bash install.sh info        # 查看客户端配置
 bash install.sh domain      # 域名与证书
 bash install.sh bandwidth   # 重新检测带宽
+bash install.sh diag        # 网络诊断（只读）
+bash install.sh tune        # 网络调优
+bash install.sh tune-rollback  # 回滚网络调优
 bash install.sh ssh-port    # 修改 SSH 端口
 bash install.sh ssh-key     # 禁用密码登录
-bash install.sh bbr         # 开启 BBR
 bash install.sh update      # 更新
 bash install.sh uninstall   # 卸载
 ```
@@ -120,7 +126,40 @@ Cloudflare API Token 在 <https://dash.cloudflare.com/profile/api-tokens> 创建
 - 安装时用 Cloudflare 测速自动检测 VPS 上下行带宽，写入 Hysteria2 服务端 `bandwidth`
 - VPS **上行** = 你的**下载**速度上限，VPS **下行** = 你的**上传**速度上限
 - Surge 的 `download-bandwidth` 请填**你本地宽带的下行带宽**。跨境线路丢包严重时填得过高反而更慢，建议从较低值开始逐步调高
+- 带宽检测对象是 Cloudflare，结果代表 **VPS 端口能力上限**，不代表到国内的真实速度
 - 更换网络或 VPS 升级后，可通过菜单 `4` 重新检测
+
+## 网络诊断与调优
+
+原则：**先测量，有证据才改，所有改动可回滚**。不预设 `MTU=1440`、`TBF`、`256MB 缓冲` 这类"万能参数"。
+
+**诊断（菜单 5，只读）**：内核/网卡/队列/缓冲现状，国内三网（IPv4/IPv6）延迟与丢包，PMTU，10 秒内 TCP 重传、网卡队列丢包、UDP 缓冲错误的**增量**。
+
+判断方法：
+
+| 现象 | 结论 |
+|---|---|
+| 网卡队列丢包为 0，但重传高 | 路径 / 上游 / 对端问题，本机调参和限速无法解决 |
+| UDP 缓冲错误持续增长 | 需要调大 UDP 缓冲（影响 Hysteria2） |
+| 网卡实际队列不是 fq | `default_qdisc` 只对新建队列生效，需要调优修正 |
+| 中间路由器 ICMP 丢包高、终点不丢 | ICMP 限速，不是真实丢包 |
+
+**调优（菜单 6）**：先测国内 RTT，结合 VPS 带宽和内存计算，**展示计划并确认后**才写入：
+
+| 项目 | 取值 | 依据 |
+|---|---|---|
+| 拥塞控制 / 队列 | BBR + fq，并把网卡现有队列切换为 fq | 内核支持 BBR 时 |
+| TCP 缓冲上限 | 2 × BDP，限制在 8–64MB 且 ≤ 内存 1/16 | 带宽 × 国内 RTT（影响 Snell 等 TCP 协议） |
+| UDP 缓冲 | ≥ 16MB | Hysteria2 / QUIC |
+| `tcp_notsent_lowat` | 128KB | 降低大缓冲带来的排队延迟 |
+| `tcp_slow_start_after_idle` | 0 | 代理长连接空闲后不重新慢启动 |
+| `tcp_mtu_probing` | 1 | 仅在 PMTU 黑洞时生效（部分服务商丢弃 ICMP） |
+| MTU / TBF / HTB | **不修改** | 没有 PMTU 异常或本机队列丢包证据时不动 |
+
+改动写入 `/etc/sysctl.d/99-onekey.conf`，说明文件 `/etc/sysctl.d/99-onekey.profile.md`，修改前的配置和运行时参数备份在 `/etc/onekey/tune-backup/`。菜单 `7` 可恢复到调优前的原始状态（文件、运行时参数、网卡队列）。
+
+> Hysteria2 走 UDP，不受 TCP 缓冲影响；跨境线路丢包严重时，调低客户端 `download-bandwidth` 或改用 IPv6 线路往往比调内核参数更有效。
+> 测真实下载方向，请在国内设备上用 iperf3 或测速网站走代理测试。
 
 ## SSH 安全选项
 
@@ -143,7 +182,9 @@ Cloudflare API Token 在 <https://dash.cloudflare.com/profile/api-tokens> 创建
 | `/etc/onekey/onekey.env` | 安装参数（含密码，权限 600） |
 | `/root/onekey_client.txt` | 客户端配置（含密码，权限 600） |
 | `/usr/local/bin/hy2-porthop.sh` | 端口跳跃 iptables 规则 |
-| `/etc/sysctl.d/99-onekey.conf` | BBR 与 UDP 缓冲区 |
+| `/etc/sysctl.d/99-onekey.conf` | 网络调优参数 |
+| `/etc/sysctl.d/99-onekey.profile.md` | 调优依据说明 |
+| `/etc/onekey/tune-backup/` | 调优前备份（用于回滚） |
 
 ## 致谢
 
