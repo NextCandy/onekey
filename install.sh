@@ -7,11 +7,11 @@
 #
 # 支持系统：Debian 10+ / Ubuntu 20.04+ / CentOS Stream / Rocky / Alma
 # 项目地址：https://github.com/NextCandy/onekey
-# 用法：bash install.sh [install|info|bandwidth|ssh-port|ssh-key|bbr|update|uninstall]
+# 用法：bash install.sh [install|info|domain|bandwidth|ssh-port|ssh-key|bbr|update|uninstall]
 
 set -euo pipefail
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 SNELL_VERSION="v5.0.1"
 
 ONEKEY_DIR="/etc/onekey"
@@ -85,6 +85,8 @@ install_deps() {
     command -v dig >/dev/null \
         || $PKG_INSTALL dnsutils >/dev/null 2>&1 || $PKG_INSTALL bind-utils >/dev/null 2>&1 || true
     command -v qrencode >/dev/null || $PKG_INSTALL qrencode >/dev/null 2>&1 || true
+    command -v jq >/dev/null || $PKG_INSTALL jq >/dev/null 2>&1 || true
+    command -v openssl >/dev/null || $PKG_INSTALL openssl >/dev/null 2>&1 || true
     ok "依赖安装完成"
 }
 
@@ -136,6 +138,9 @@ import_existing() {
     CLIENT_DOWN=$(grep -ohE 'download-bandwidth=[0-9]+' /root/surge_proxy.conf "${INFO_FILE}" 2>/dev/null | head -1 | cut -d= -f2 || true)
     CLIENT_DOWN=${CLIENT_DOWN:-$(( BW_UP < 500 ? BW_UP : 500 ))}
     NODE_NAME=$(echo "${DOMAIN%%.*}" | tr '[:lower:]' '[:upper:]')
+    ACME_TYPE=$(awk '/^acme:/{f=1} f && /^  type:/{print $2; exit}' "${HY2_CONF}")
+    ACME_TYPE=${ACME_TYPE:-http}
+    CF_TOKEN=$(awk '/cloudflare_api_token:/{print $2; exit}' "${HY2_CONF}")
     SERVER_IP4=$(curl -s4m8 https://api.ipify.org || true)
     SERVER_IP6=$(curl -s6m8 https://api6.ipify.org || true)
     save_env
@@ -166,6 +171,8 @@ SNELL_PSK="${SNELL_PSK}"
 BW_UP="${BW_UP}"
 BW_DOWN="${BW_DOWN}"
 CLIENT_DOWN="${CLIENT_DOWN}"
+ACME_TYPE="${ACME_TYPE:-http}"
+CF_TOKEN="${CF_TOKEN:-}"
 EOF
     chmod 600 "${ENV_FILE}"
 }
@@ -264,41 +271,256 @@ do_bandwidth() {
 }
 
 # ============================================================
-# 交互输入
+# 域名解析 / 证书
 # ============================================================
 
-read_inputs() {
+detect_ips() {
     SERVER_IP4=$(curl -s4m8 https://api.ipify.org || true)
     SERVER_IP6=$(curl -s6m8 https://api6.ipify.org || true)
     echo "本机 IPv4：${SERVER_IP4:-无}"
     echo "本机 IPv6：${SERVER_IP6:-无}"
     [[ -n "${SERVER_IP4}${SERVER_IP6}" ]] || die "无法获取本机公网 IP"
+}
 
+# 通过 DoH 查询公共 DNS，避免本机 DNS 缓存导致误判。$1=A|AAAA  $2=domain
+doh_query() {
+    local out re='^[0-9.]+$'
+    [[ $1 == AAAA ]] && re=':'
+    if out=$(curl -s -m 8 -H 'accept: application/dns-json' \
+            "https://cloudflare-dns.com/dns-query?name=$2&type=$1" 2>/dev/null) && [[ -n "${out}" ]]; then
+        echo "${out}" | grep -oE '"data":"[^"]*"' | cut -d'"' -f4 | grep -E "${re}" | tail -1 || true
+    else
+        resolve "$1" "$2" || true
+    fi
+}
+
+# 返回 0 表示解析正确，并打印当前解析结果
+check_dns() {
+    local a4 a6
+    a4=$(doh_query A "${DOMAIN}"); a6=$(doh_query AAAA "${DOMAIN}")
+    echo "   当前解析：A=${a4:-无}  AAAA=${a6:-无}"
+    [[ -n "${a4}${a6}" ]] || return 1
+    # Let's Encrypt 有 AAAA 记录时优先走 IPv6 验证，所以 AAAA 如果存在必须正确
+    [[ -z "${a6}" || "${a6}" == "${SERVER_IP6}" ]] || return 1
+    [[ -z "${a4}" || "${a4}" == "${SERVER_IP4}" ]] || return 1
+    # 本机有 IPv4 时必须有 A 记录（客户端默认走 IPv4）
+    [[ -z "${SERVER_IP4}" || -n "${a4}" ]] || return 1
+    return 0
+}
+
+cf_api() {
+    # $1=METHOD $2=PATH [$3=JSON]
+    curl -s -m 15 -X "$1" "https://api.cloudflare.com/client/v4$2" \
+        -H "Authorization: Bearer ${CF_TOKEN}" -H "Content-Type: application/json" ${3:+--data "$3"}
+}
+
+cf_zone_id() {
+    local d=${DOMAIN} zid
+    while [[ "${d}" == *.* ]]; do
+        zid=$(cf_api GET "/zones?name=${d}" | jq -r '.result[0].id // empty' 2>/dev/null || true)
+        [[ -n "${zid}" ]] && { echo "${zid}"; return 0; }
+        d=${d#*.}
+    done
+    return 1
+}
+
+# $1=zone_id $2=A|AAAA $3=ip
+cf_upsert() {
+    local rid data res
+    rid=$(cf_api GET "/zones/$1/dns_records?type=$2&name=${DOMAIN}" | jq -r '.result[0].id // empty' 2>/dev/null || true)
+    data=$(jq -nc --arg t "$2" --arg n "${DOMAIN}" --arg c "$3" '{type:$t,name:$n,content:$c,ttl:120,proxied:false}')
+    if [[ -n "${rid}" ]]; then
+        res=$(cf_api PUT "/zones/$1/dns_records/${rid}" "${data}")
+    else
+        res=$(cf_api POST "/zones/$1/dns_records" "${data}")
+    fi
+    if [[ "$(echo "${res}" | jq -r '.success' 2>/dev/null)" == "true" ]]; then
+        ok "Cloudflare：$2 ${DOMAIN} -> $3（仅 DNS）"
+    else
+        warn "Cloudflare：$2 记录设置失败：$(echo "${res}" | jq -r '.errors[0].message // "未知错误"' 2>/dev/null)"
+        return 1
+    fi
+}
+
+cf_setup_records() {
+    command -v jq >/dev/null || { warn "缺少 jq，无法使用 Cloudflare API"; return 1; }
+    echo "需要一个 Cloudflare API Token，权限：Zone → DNS → Edit，Zone → Zone → Read"
+    echo "创建地址：https://dash.cloudflare.com/profile/api-tokens（可用「Edit zone DNS」模板）"
+    read -rsp "请输入 Cloudflare API Token（输入不显示）：" CF_TOKEN; echo
+    [[ -n "${CF_TOKEN}" ]] || return 1
+    local zid
+    if ! zid=$(cf_zone_id); then
+        warn "找不到 ${DOMAIN} 所在的 Cloudflare 区域，请检查 Token 权限和域名"
+        CF_TOKEN=""
+        return 1
+    fi
+    ok "找到 Cloudflare 区域"
+    if [[ -n "${SERVER_IP4}" ]]; then cf_upsert "${zid}" A "${SERVER_IP4}" || return 1; fi
+    if [[ -n "${SERVER_IP6}" ]]; then cf_upsert "${zid}" AAAA "${SERVER_IP6}" || return 1; fi
+    return 0
+}
+
+# 等待解析生效；返回 0=继续 1=重新输入域名
+wait_dns() {
+    local i n
+    while true; do
+        info "检查 ${DOMAIN} 解析（每 10 秒一次，最长 5 分钟）..."
+        for i in $(seq 1 30); do
+            if check_dns; then ok "域名解析已生效"; return 0; fi
+            sleep 10
+        done
+        warn "解析仍未生效或与本机 IP 不一致"
+        echo "  1. 继续等待   2. 重新输入域名   3. 忽略并继续（证书申请可能失败）"
+        read -rp "请选择（默认 1）：" n
+        case "${n:-1}" in
+            2) return 1 ;;
+            3) return 0 ;;
+            *) ;;
+        esac
+    done
+}
+
+# 交互式设置域名：输入域名 -> 添加解析（手动 / Cloudflare 自动）-> 等待生效 -> 选择证书验证方式
+setup_domain() {
+    local n def
+    CF_TOKEN=${CF_TOKEN:-}
+    while true; do
+        echo
+        read -rp "请输入域名（如 hy.example.com）：" DOMAIN
+        DOMAIN=$(echo "${DOMAIN}" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+        if ! [[ "${DOMAIN}" =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]]; then
+            warn "域名格式不正确"; continue
+        fi
+
+        echo
+        echo "需要的解析记录（Cloudflare 必须关闭小黄云，设为「仅 DNS」）："
+        [[ -n "${SERVER_IP4}" ]] && echo "   A     ${DOMAIN}  ->  ${SERVER_IP4}"
+        [[ -n "${SERVER_IP6}" ]] && echo "   AAAA  ${DOMAIN}  ->  ${SERVER_IP6}"
+        echo
+        if check_dns; then
+            ok "解析已正确，无需修改"
+        else
+            echo "  1. 我自己去 DNS 后台添加（添加后脚本自动检测）"
+            echo "  2. 使用 Cloudflare API Token 自动添加"
+            read -rp "请选择（默认 1）：" n
+            if [[ "${n}" == 2 ]]; then
+                cf_setup_records || warn "自动添加失败，请手动添加上面的记录"
+            else
+                read -rp "添加完成后按回车开始检测..." _
+            fi
+            wait_dns || continue
+        fi
+        break
+    done
+
+    # 证书验证方式
+    def=1; [[ -n "${CF_TOKEN}" ]] && def=2
     echo
-    echo "请先为域名添加解析：A 记录 -> ${SERVER_IP4:-（无）}${SERVER_IP6:+，AAAA 记录 -> ${SERVER_IP6}}"
-    echo "Cloudflare 请关闭小黄云（仅 DNS）。"
-    read -rp "请输入域名：" DOMAIN
-    [[ -n "${DOMAIN}" ]] || die "域名不能为空"
+    echo "证书申请方式（Let's Encrypt，到期前自动续期）："
+    echo "  1. HTTP 验证（需要 80 端口空闲并对外开放）"
+    echo "  2. DNS 验证（仅限 Cloudflare 托管的域名，不需要 80 端口）"
+    read -rp "请选择（默认 ${def}）：" n
+    n=${n:-${def}}
+    if [[ "${n}" == 2 ]]; then
+        if [[ -z "${CF_TOKEN}" ]]; then
+            read -rsp "请输入 Cloudflare API Token（输入不显示）：" CF_TOKEN; echo
+        fi
+        [[ -n "${CF_TOKEN}" ]] || die "Token 不能为空"
+        ACME_TYPE="dns"
+    else
+        ACME_TYPE="http"; CF_TOKEN=""
+        # 允许 80 端口被 Hysteria 自己占用（续期时），其余占用则无法 HTTP 验证
+        if port_in_use tcp 80 && ! ss -lntp 2>/dev/null | grep -E '[:.]80 ' | grep -q hysteria; then
+            die "TCP 80 被占用，无法 HTTP 验证。请停止占用 80 端口的服务（如 Nginx），或选择 DNS 验证"
+        fi
+    fi
+    ok "域名：${DOMAIN}，证书验证方式：${ACME_TYPE^^}"
+}
 
-    local a4 a6 good=0
-    a4=$(resolve A "${DOMAIN}" || true)
-    a6=$(resolve AAAA "${DOMAIN}" || true)
-    echo "解析结果：A=${a4:-无}  AAAA=${a6:-无}"
-    # Let's Encrypt 有 AAAA 记录时优先走 IPv6 验证，所以 AAAA 必须正确
-    if [[ -n "${a6}" && "${a6}" != "${SERVER_IP6}" ]]; then
-        warn "AAAA 记录与本机 IPv6 不一致，证书申请大概率失败"
-    elif [[ -n "${a4}" && "${a4}" != "${SERVER_IP4}" ]]; then
-        warn "A 记录与本机 IPv4 不一致"
-    elif [[ -n "${a4}${a6}" ]]; then
-        good=1
-    else
-        warn "域名没有解析记录"
+cert_file() {
+    local home
+    home=$(getent passwd hysteria | cut -d: -f6 || true)
+    find /var/lib/hysteria /etc/hysteria ${home:+"${home}"} -name "${DOMAIN}.crt" -path '*certificates*' 2>/dev/null | head -1 || true
+}
+
+cert_status() {
+    local f end days
+    f=$(cert_file)
+    if [[ -z "${f}" ]]; then
+        warn "未找到 ${DOMAIN} 的证书"
+        return 1
     fi
-    if [[ ${good} -eq 1 ]]; then
-        ok "域名解析正确"
-    else
-        confirm "仍要继续吗？" || exit 1
-    fi
+    end=$(openssl x509 -in "${f}" -noout -enddate | cut -d= -f2)
+    days=$(( ( $(date -d "${end}" +%s) - $(date +%s) ) / 86400 ))
+    echo "   域名：${DOMAIN}"
+    echo "   签发：$(openssl x509 -in "${f}" -noout -issuer | sed 's/^issuer=//')"
+    echo "   到期：${end}（剩余 ${days} 天，到期前自动续期）"
+    echo "   方式：${ACME_TYPE^^} 验证"
+}
+
+# 重启 Hysteria2 并等待证书就绪
+restart_and_wait_cert() {
+    local since i log
+    since=$(date '+%F %T')
+    systemctl restart hysteria-server.service
+    info "正在申请/加载证书（最长 2 分钟）..."
+    for i in $(seq 1 60); do
+        log=$(journalctl -u hysteria-server --since "${since}" --no-pager 2>/dev/null || true)
+        if echo "${log}" | grep -q "server up and running"; then
+            ok "证书就绪，Hysteria2 已启动"
+            cert_status || true
+            return 0
+        fi
+        if echo "${log}" | grep -qiE "fatal|failed to (load|obtain)"; then
+            break
+        fi
+        sleep 2
+    done
+    warn "证书申请失败或超时，最近日志："
+    journalctl -u hysteria-server --since "${since}" --no-pager 2>/dev/null | tail -8 || true
+    echo "常见原因：解析未生效 / 80 端口未开放（HTTP 验证）/ Token 权限不足（DNS 验证）/ 申请过于频繁被限流"
+    return 1
+}
+
+do_domain() {
+    load_env
+    local n old f
+    echo
+    echo "  1. 查看证书状态"
+    echo "  2. 更换域名并申请证书"
+    echo "  3. 强制重新申请证书"
+    read -rp "请选择：" n
+    case "${n}" in
+        1) cert_status || true ;;
+        2)
+            old=${DOMAIN}
+            detect_ips
+            setup_domain
+            save_env
+            write_hy2_conf
+            if [[ "${ACME_TYPE}" == http ]]; then OPEN_80_ONLY=1 open_firewall || true; fi
+            restart_and_wait_cert || true
+            write_info
+            ok "域名已从 ${old} 更换为 ${DOMAIN}"
+            warn "客户端配置中的域名 / sni 已变化，请通过菜单「查看客户端配置」重新导入"
+            ;;
+        3)
+            confirm "将删除 ${DOMAIN} 的现有证书并重新申请，确定？" || return 0
+            f=$(cert_file)
+            [[ -n "${f}" ]] && rm -rf "$(dirname "${f}")"
+            restart_and_wait_cert || true
+            ;;
+        *) warn "无效选项" ;;
+    esac
+}
+
+# ============================================================
+# 交互输入
+# ============================================================
+
+read_inputs() {
+    detect_ips
+    setup_domain
 
     echo
     read -rp "Hysteria2 监听 UDP 端口（默认 443）：" HY2_PORT
@@ -333,8 +555,6 @@ read_inputs() {
     is_port "${SNELL_PORT}" || die "端口无效"
     port_in_use tcp "${SNELL_PORT}" && die "TCP ${SNELL_PORT} 已被占用"
 
-    port_in_use tcp 80 && die "TCP 80 被占用（ACME 证书申请需要），请先停止占用 80 端口的服务（如 Nginx）"
-
     local def_name
     def_name=$(echo "${DOMAIN%%.*}" | tr '[:lower:]' '[:upper:]')
     read -rp "节点名称，可带国旗 emoji，如 🇺🇸 US（默认 ${def_name}）：" NODE_NAME
@@ -349,19 +569,26 @@ read_inputs() {
 open_firewall() {
     # 只放行端口，不关闭防火墙
     local p
-    local tcp_ports=(80 "${SNELL_PORT}") udp_ports=("${HY2_PORT}" "${SNELL_PORT}")
-    [[ -n "${HOP_RANGE}" ]] && udp_ports+=("${HOP_RANGE}")
+    local tcp_ports=() udp_ports=()
+    [[ "${ACME_TYPE:-http}" == http ]] && tcp_ports+=(80)
+    if [[ -z "${OPEN_80_ONLY:-}" ]]; then
+        tcp_ports+=("${SNELL_PORT}"); udp_ports+=("${HY2_PORT}" "${SNELL_PORT}")
+        [[ -n "${HOP_RANGE}" ]] && udp_ports+=("${HOP_RANGE}")
+    fi
+    (( ${#tcp_ports[@]} + ${#udp_ports[@]} > 0 )) || return 0
     if command -v ufw >/dev/null && ufw status | grep -q "Status: active"; then
-        for p in "${tcp_ports[@]}"; do ufw allow "${p/-/:}/tcp" >/dev/null; done
-        for p in "${udp_ports[@]}"; do ufw allow "${p/-/:}/udp" >/dev/null; done
+        for p in "${tcp_ports[@]+"${tcp_ports[@]}"}"; do ufw allow "${p/-/:}/tcp" >/dev/null; done
+        for p in "${udp_ports[@]+"${udp_ports[@]}"}"; do ufw allow "${p/-/:}/udp" >/dev/null; done
         ok "ufw 已放行端口"
     elif command -v firewall-cmd >/dev/null && firewall-cmd --state >/dev/null 2>&1; then
-        for p in "${tcp_ports[@]}"; do firewall-cmd --permanent --add-port="${p}/tcp" >/dev/null; done
-        for p in "${udp_ports[@]}"; do firewall-cmd --permanent --add-port="${p}/udp" >/dev/null; done
+        for p in "${tcp_ports[@]+"${tcp_ports[@]}"}"; do firewall-cmd --permanent --add-port="${p}/tcp" >/dev/null; done
+        for p in "${udp_ports[@]+"${udp_ports[@]}"}"; do firewall-cmd --permanent --add-port="${p}/udp" >/dev/null; done
         firewall-cmd --reload >/dev/null
         ok "firewalld 已放行端口"
     fi
-    warn "云服务商安全组请放行（IPv4/IPv6 都要）：80/tcp、${HY2_PORT}/udp、${SNELL_PORT}/tcp+udp${HOP_RANGE:+、${HOP_RANGE}/udp}"
+    [[ -n "${OPEN_80_ONLY:-}" ]] && return 0
+    local p80=""; [[ "${ACME_TYPE:-http}" == http ]] && p80="80/tcp、"
+    warn "云服务商安全组请放行（IPv4/IPv6 都要）：${p80}${HY2_PORT}/udp、${SNELL_PORT}/tcp+udp${HOP_RANGE:+、${HOP_RANGE}/udp}"
 }
 
 # ============================================================
@@ -454,7 +681,15 @@ write_hy2_conf() {
         echo "    - ${DOMAIN}"
         echo "  email: admin@${DOMAIN}"
         echo "  ca: letsencrypt"
-        echo "  type: http"
+        if [[ "${ACME_TYPE:-http}" == dns ]]; then
+            echo "  type: dns"
+            echo "  dns:"
+            echo "    name: cloudflare"
+            echo "    config:"
+            echo "      cloudflare_api_token: ${CF_TOKEN}"
+        else
+            echo "  type: http"
+        fi
         echo
         echo "auth:"
         echo "  type: password"
@@ -488,18 +723,7 @@ install_hysteria() {
     command -v hysteria >/dev/null || die "Hysteria2 安装失败"
     write_hy2_conf
     systemctl enable hysteria-server.service >/dev/null 2>&1
-    systemctl restart hysteria-server.service
-
-    info "等待 ACME 证书签发..."
-    local i
-    for i in $(seq 1 30); do
-        if journalctl -u hysteria-server --since "-2min" --no-pager 2>/dev/null | grep -q "server up and running"; then
-            ok "Hysteria2 已启动（证书签发成功）"
-            return 0
-        fi
-        sleep 2
-    done
-    warn "未确认 Hysteria2 启动成功，请执行 journalctl -u hysteria-server -e 查看日志"
+    restart_and_wait_cert || warn "可稍后通过菜单「域名与证书」重新申请"
 }
 
 # ============================================================
@@ -870,27 +1094,29 @@ menu() {
         echo "  ------------------------------------------------"
         echo "  1. 安装 Hysteria2 + Snell"
         echo "  2. 查看客户端配置（Surge / Shadowrocket 二维码）"
-        echo "  3. 重新检测带宽并更新"
+        echo "  3. 域名与证书（查看 / 更换域名 / 重新申请）"
+        echo "  4. 重新检测带宽并更新"
         echo "  ------------------------------------------------"
-        echo "  4. 修改 SSH 端口"
-        echo "  5. 禁用密码登录（仅允许密钥登录）"
-        echo "  6. 开启 BBR"
+        echo "  5. 修改 SSH 端口"
+        echo "  6. 禁用密码登录（仅允许密钥登录）"
+        echo "  7. 开启 BBR"
         echo "  ------------------------------------------------"
-        echo "  7. 更新 Hysteria2 / Snell"
-        echo "  8. 卸载"
+        echo "  8. 更新 Hysteria2 / Snell"
+        echo "  9. 卸载"
         echo "  0. 退出"
         echo
-        read -rp "请选择 [0-8]：" n
+        read -rp "请选择 [0-9]：" n
         # 每个操作在子 shell 中执行：出错只结束当前操作，回到菜单
         case "${n}" in
             1) ( do_install ) || true ;;
             2) ( show_info ) || true ;;
-            3) ( do_bandwidth ) || true ;;
-            4) ( do_ssh_port ) || true ;;
-            5) ( do_ssh_key ) || true ;;
-            6) ( enable_bbr ) || true ;;
-            7) ( do_update ) || true ;;
-            8) ( do_uninstall ) || true ;;
+            3) ( do_domain ) || true ;;
+            4) ( do_bandwidth ) || true ;;
+            5) ( do_ssh_port ) || true ;;
+            6) ( do_ssh_key ) || true ;;
+            7) ( enable_bbr ) || true ;;
+            8) ( do_update ) || true ;;
+            9) ( do_uninstall ) || true ;;
             0) exit 0 ;;
             *) warn "无效选项" ;;
         esac
@@ -904,6 +1130,7 @@ main() {
     case "${1:-}" in
         install)   do_install ;;
         info)      show_info ;;
+        domain)    do_domain ;;
         bandwidth) do_bandwidth ;;
         ssh-port)  do_ssh_port ;;
         ssh-key)   do_ssh_key ;;
@@ -911,7 +1138,7 @@ main() {
         update)    do_update ;;
         uninstall) do_uninstall ;;
         "")        menu ;;
-        *)         die "未知参数：$1（可用：install|info|bandwidth|ssh-port|ssh-key|bbr|update|uninstall）" ;;
+        *)         die "未知参数：$1（可用：install|info|domain|bandwidth|ssh-port|ssh-key|bbr|update|uninstall）" ;;
     esac
 }
 

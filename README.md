@@ -2,7 +2,9 @@
 
 Surge / Shadowrocket 一键部署脚本：**Hysteria2 + Snell v5**，交互式菜单，开箱即用。
 
-- **Hysteria2**（主力）：UDP/QUIC，自动申请 Let's Encrypt 证书，支持**端口跳跃**、伪装网站、可选 Salamander 混淆
+- **交互式添加域名**：可手动解析，或填 Cloudflare API Token **自动添加 A/AAAA 记录**；自动等待解析生效
+- **自动申请证书**：Let's Encrypt，支持 HTTP 验证或 Cloudflare DNS 验证（无需 80 端口），自动续期
+- **Hysteria2**（主力）：UDP/QUIC，支持**端口跳跃**、伪装网站、可选 Salamander 混淆
 - **Snell v5**（备用）：TCP，Surge 官方协议，UDP 被限速/阻断时自动回落
 - **IPv4 / IPv6 双线路**：默认 IPv4，可在客户端切换 IPv6
 - **自动检测 VPS 带宽**并写入 Hysteria2 服务端配置
@@ -24,20 +26,21 @@ bash <(curl -fsSL https://raw.githubusercontent.com/NextCandy/onekey/main/instal
 ## 菜单
 
 ```
-  onekey v1.0.0 —— Hysteria2 + Snell for Surge / Shadowrocket
+  onekey v1.1.0 —— Hysteria2 + Snell for Surge / Shadowrocket
   ------------------------------------------------
   状态：Hysteria2 active | Snell active | BBR bbr | SSH 端口 22
   ------------------------------------------------
   1. 安装 Hysteria2 + Snell
   2. 查看客户端配置（Surge / Shadowrocket 二维码）
-  3. 重新检测带宽并更新
+  3. 域名与证书（查看 / 更换域名 / 重新申请）
+  4. 重新检测带宽并更新
   ------------------------------------------------
-  4. 修改 SSH 端口
-  5. 禁用密码登录（仅允许密钥登录）
-  6. 开启 BBR
+  5. 修改 SSH 端口
+  6. 禁用密码登录（仅允许密钥登录）
+  7. 开启 BBR
   ------------------------------------------------
-  7. 更新 Hysteria2 / Snell
-  8. 卸载
+  8. 更新 Hysteria2 / Snell
+  9. 卸载
   0. 退出
 ```
 
@@ -46,6 +49,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/NextCandy/onekey/main/instal
 ```bash
 bash install.sh install     # 安装
 bash install.sh info        # 查看客户端配置
+bash install.sh domain      # 域名与证书
 bash install.sh bandwidth   # 重新检测带宽
 bash install.sh ssh-port    # 修改 SSH 端口
 bash install.sh ssh-key     # 禁用密码登录
@@ -57,18 +61,16 @@ bash install.sh uninstall   # 卸载
 ## 安装前准备
 
 1. 一台 VPS：Debian 10+ / Ubuntu 20.04+ / CentOS Stream / Rocky / Alma，x86_64 或 ARM64
-2. 一个域名，添加解析记录（**Cloudflare 请关闭小黄云，设为「仅 DNS」**）：
-
-   | 类型 | 主机记录 | 值 |
-   |---|---|---|
-   | A | `hy` | VPS 的 IPv4 |
-   | AAAA | `hy` | VPS 的 IPv6（没有 IPv6 可不加） |
+2. 一个域名。安装时脚本会交互式引导：
+   - 显示需要添加的记录（A → VPS IPv4，AAAA → VPS IPv6），**Cloudflare 必须关闭小黄云（仅 DNS）**
+   - 可以自己去 DNS 后台添加，也可以填 **Cloudflare API Token 由脚本自动添加**
+   - 脚本通过 DoH 查询公共 DNS，**自动等待解析生效**后再申请证书
 
 3. 云服务商安全组放行（IPv4/IPv6 都要）：
 
    | 端口 | 协议 | 用途 |
    |---|---|---|
-   | 80 | TCP | 证书申请与续期 |
+   | 80 | TCP | 证书申请与续期（选 DNS 验证则不需要） |
    | 443 | UDP | Hysteria2 |
    | 20000-50000 | UDP | Hysteria2 端口跳跃 |
    | Snell 端口 | TCP + UDP | Snell v5 |
@@ -102,12 +104,23 @@ US IPv6 = fallback, "US HY2 v6", "US Snell v6", interval=300, timeout=5
 
 脚本会输出 `hysteria2://` 链接和终端二维码（IPv4、IPv6 各一个），复制链接或扫码即可导入。Shadowrocket 不支持 Snell v5，只提供 Hysteria2。
 
+## 域名与证书
+
+| 证书验证方式 | 要求 | 说明 |
+|---|---|---|
+| HTTP 验证（默认） | 80/tcp 空闲且对外开放 | 适用于任何 DNS 服务商 |
+| DNS 验证 | 域名托管在 Cloudflare | 不需要 80 端口，适合 80 端口被封或被占用的机器 |
+
+Cloudflare API Token 在 <https://dash.cloudflare.com/profile/api-tokens> 创建，使用「Edit zone DNS」模板即可（权限：Zone → DNS → Edit）。Token 保存在服务器上权限为 600 的文件中，用于自动续期。
+
+证书到期前由 Hysteria2 自动续期。菜单 `3` 可以查看证书状态、更换域名（重新引导解析并申请证书）、强制重新申请。
+
 ## 带宽说明
 
 - 安装时用 Cloudflare 测速自动检测 VPS 上下行带宽，写入 Hysteria2 服务端 `bandwidth`
 - VPS **上行** = 你的**下载**速度上限，VPS **下行** = 你的**上传**速度上限
 - Surge 的 `download-bandwidth` 请填**你本地宽带的下行带宽**。跨境线路丢包严重时填得过高反而更慢，建议从较低值开始逐步调高
-- 更换网络或 VPS 升级后，可通过菜单 `3` 重新检测
+- 更换网络或 VPS 升级后，可通过菜单 `4` 重新检测
 
 ## SSH 安全选项
 
